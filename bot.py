@@ -1,10 +1,10 @@
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -17,6 +17,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
+REMINDER_CHANNEL_ID = os.getenv("REMINDER_CHANNEL_ID")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN을 찾을 수 없습니다.")
@@ -26,6 +27,10 @@ if not GUILD_ID:
 
 GUILD_ID = int(GUILD_ID)
 
+if REMINDER_CHANNEL_ID:
+    REMINDER_CHANNEL_ID = int(REMINDER_CHANNEL_ID)
+
+
 # 한국 시간
 KST = ZoneInfo("Asia/Seoul")
 
@@ -34,7 +39,7 @@ DAILY_GOAL = 6
 
 # XP
 XP_PER_CYCLE = 50
-XP_PER_TEMPTATION = 10
+XP_PER_DISTRACTION = 10
 XP_PER_LEVEL = 500
 
 
@@ -92,6 +97,10 @@ class StudyBot(commands.Bot):
         synced = await self.tree.sync(guild=guild)
 
         print(f"슬래시 명령어 {len(synced)}개 등록 완료!")
+
+        # 매일 오후 5시 알림 시작
+        if not daily_reminder.is_running():
+            daily_reminder.start()
 
 
 bot = StudyBot()
@@ -209,24 +218,17 @@ def calculate_streaks(user_id):
         (user_id,)
     ).fetchall()
 
-
     if not rows:
         return 0, 0
-
 
     study_dates = [
         datetime.strptime(row[0], "%Y-%m-%d").date()
         for row in rows
     ]
 
-
-    # --------------------------
-    # 최장 연속 기록
-    # --------------------------
-
+    # 최장 연속
     longest_streak = 1
     running_streak = 1
-
 
     for i in range(1, len(study_dates)):
 
@@ -243,29 +245,20 @@ def calculate_streaks(user_id):
             )
 
         else:
-
             running_streak = 1
 
 
-    # --------------------------
-    # 현재 연속 기록
-    # --------------------------
-
+    # 현재 연속
     latest_study_day = study_dates[-1]
-
     today_date = datetime.now(KST).date()
 
-
-    # 마지막 공부가 어제보다 이전이면 streak 종료
     if latest_study_day < today_date - timedelta(days=1):
 
         current_streak = 0
 
-
     else:
 
         current_streak = 1
-
 
         for i in range(
             len(study_dates) - 1,
@@ -274,21 +267,98 @@ def calculate_streaks(user_id):
         ):
 
             current_day = study_dates[i]
-
             previous_day = study_dates[i - 1]
 
-
             if current_day == previous_day + timedelta(days=1):
-
                 current_streak += 1
 
-
             else:
-
                 break
 
-
     return current_streak, longest_streak
+
+
+# ==================================================
+# 매일 오후 5시 정산 알림
+# ==================================================
+
+@tasks.loop(
+    time=time(
+        hour=17,
+        minute=0,
+        tzinfo=KST
+    )
+)
+async def daily_reminder():
+
+    if REMINDER_CHANNEL_ID is None:
+
+        print(
+            "REMINDER_CHANNEL_ID가 없어 "
+            "오후 5시 알림을 보낼 수 없습니다."
+        )
+
+        return
+
+
+    channel = bot.get_channel(
+        REMINDER_CHANNEL_ID
+    )
+
+
+    # 캐시에 채널이 없으면 직접 가져오기
+    if channel is None:
+
+        try:
+            channel = await bot.fetch_channel(
+                REMINDER_CHANNEL_ID
+            )
+
+        except Exception as error:
+
+            print(
+                f"알림 채널을 찾지 못했습니다: {error}"
+            )
+
+            return
+
+
+    message = (
+        "@everyone\n\n"
+        "📚 **오늘의 공부 정산 시간입니다!**\n\n"
+        "오늘 포스트잇에 기록한 사이클을 확인하고 "
+        "`/정산`으로 하루 공부를 기록해 주세요.\n\n"
+        "✅ 수학\n"
+        "✅ 국어\n"
+        "✅ 영어\n"
+        "✅ 탐구\n"
+        "🛡️ 집중 방해 극복 횟수\n\n"
+        "**오늘의 기록을 남기고 하루를 마무리하세요.**"
+    )
+
+
+    try:
+
+        await channel.send(
+            message,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=True
+            )
+        )
+
+        print("오후 5시 공부 정산 알림 전송 완료!")
+
+    except Exception as error:
+
+        print(
+            f"오후 5시 알림 전송 실패: {error}"
+        )
+
+
+@daily_reminder.before_loop
+async def before_daily_reminder():
+
+    await bot.wait_until_ready()
 
 
 # ==================================================
@@ -332,7 +402,7 @@ async def test(interaction: discord.Interaction):
     국어="국어 공부 사이클 수",
     영어="영어 공부 사이클 수",
     탐구="탐구 공부 사이클 수",
-    유혹="미디어 유혹을 참은 횟수"
+    집중방해="집중 방해를 이겨낸 횟수"
 )
 async def settlement(
     interaction: discord.Interaction,
@@ -340,13 +410,10 @@ async def settlement(
     국어: int = 0,
     영어: int = 0,
     탐구: int = 0,
-    유혹: int = 0
+    집중방해: int = 0
 ):
 
-    # ==================================================
     # 오후 5시 이전 정산 금지
-    # ==================================================
-
     if current_hour() < 17:
 
         await interaction.response.send_message(
@@ -360,11 +427,14 @@ async def settlement(
         return
 
 
-    # ==================================================
     # 음수 방지
-    # ==================================================
-
-    numbers = [수학, 국어, 영어, 탐구, 유혹]
+    numbers = [
+        수학,
+        국어,
+        영어,
+        탐구,
+        집중방해
+    ]
 
     if any(number < 0 for number in numbers):
 
@@ -376,23 +446,35 @@ async def settlement(
         return
 
 
-    # ==================================================
     # 오늘 계산
-    # ==================================================
+    total_cycles = (
+        수학
+        + 국어
+        + 영어
+        + 탐구
+    )
 
-    total_cycles = 수학 + 국어 + 영어 + 탐구
 
     grade, grade_bonus, grade_icon = get_grade(
         total_cycles
     )
 
-    study_xp = total_cycles * XP_PER_CYCLE
 
-    temptation_xp = 유혹 * XP_PER_TEMPTATION
+    study_xp = (
+        total_cycles
+        * XP_PER_CYCLE
+    )
+
+
+    distraction_xp = (
+        집중방해
+        * XP_PER_DISTRACTION
+    )
+
 
     total_xp_today = (
         study_xp
-        + temptation_xp
+        + distraction_xp
         + grade_bonus
     )
 
@@ -412,10 +494,14 @@ async def settlement(
         (interaction.user.id,)
     ).fetchone()
 
-    previous_total_xp = previous_total_result[0] or 0
+
+    previous_total_xp = (
+        previous_total_result[0]
+        or 0
+    )
 
 
-    # 오늘 기존 기록 XP 확인
+    # 기존 오늘 기록
     existing_today = db.execute(
         """
         SELECT xp
@@ -440,10 +526,6 @@ async def settlement(
     )
 
 
-    # ==================================================
-    # 레벨 비교용
-    # ==================================================
-
     previous_level = get_level(
         previous_total_xp
     )
@@ -463,6 +545,10 @@ async def settlement(
 
     # ==================================================
     # DB 저장
+    #
+    # DB 컬럼명 temptations는 기존 기록 호환을 위해
+    # 그대로 사용한다.
+    # 사용자에게는 "집중 방해"라고 표시한다.
     # ==================================================
 
     db.execute(
@@ -497,7 +583,7 @@ async def settlement(
             국어,
             영어,
             탐구,
-            유혹,
+            집중방해,
             total_xp_today
         )
     )
@@ -505,10 +591,7 @@ async def settlement(
     db.commit()
 
 
-    # ==================================================
     # streak
-    # ==================================================
-
     current_streak, longest_streak = calculate_streaks(
         interaction.user.id
     )
@@ -554,8 +637,8 @@ async def settlement(
 
 
     embed.add_field(
-        name="🛡️ 미디어 유혹 극복",
-        value=f"**{유혹}회**",
+        name="🛡️ 집중 방해 극복",
+        value=f"**{집중방해}회**",
         inline=True
     )
 
@@ -564,7 +647,7 @@ async def settlement(
         name="⭐ XP 획득",
         value=(
             f"공부 : **+{study_xp} XP**\n"
-            f"절제 : **+{temptation_xp} XP**\n"
+            f"집중 방해 극복 : **+{distraction_xp} XP**\n"
             f"{grade} 보너스 : **+{grade_bonus} XP**\n\n"
             f"오늘 총 획득 : **+{total_xp_today} XP**"
         ),
@@ -572,13 +655,12 @@ async def settlement(
     )
 
 
-    # ==================================================
-    # 레벨업 여부
-    # ==================================================
-
+    # 레벨업
     if new_level > previous_level:
 
-        new_title = get_title(new_level)
+        new_title = get_title(
+            new_level
+        )
 
         embed.add_field(
             name="🎉 LEVEL UP!",
@@ -642,7 +724,15 @@ async def check_today(
         return
 
 
-    math, korean, english, inquiry, temptations, xp = result
+    (
+        math,
+        korean,
+        english,
+        inquiry,
+        distractions,
+        xp
+    ) = result
+
 
     total_cycles = (
         math
@@ -705,8 +795,8 @@ async def check_today(
 
 
     embed.add_field(
-        name="🛡️ 미디어 유혹 극복",
-        value=f"**{temptations}회**",
+        name="🛡️ 집중 방해 극복",
+        value=f"**{distractions}회**",
         inline=True
     )
 
@@ -743,10 +833,6 @@ async def records(
     )
 
 
-    # ==================================================
-    # 누적 정보
-    # ==================================================
-
     totals = db.execute(
         """
         SELECT
@@ -759,17 +845,11 @@ async def records(
             ),
 
             SUM(math + korean + english + inquiry),
-
             SUM(math),
-
             SUM(korean),
-
             SUM(english),
-
             SUM(inquiry),
-
             SUM(temptations),
-
             SUM(xp)
 
         FROM daily_records
@@ -781,26 +861,18 @@ async def records(
 
 
     study_days = totals[0] or 0
-
     total_cycles = totals[1] or 0
 
     total_math = totals[2] or 0
-
     total_korean = totals[3] or 0
-
     total_english = totals[4] or 0
-
     total_inquiry = totals[5] or 0
 
-    total_temptations = totals[6] or 0
-
+    total_distractions = totals[6] or 0
     total_xp = totals[7] or 0
 
 
-    # ==================================================
     # 레벨
-    # ==================================================
-
     level = get_level(
         total_xp
     )
@@ -828,10 +900,7 @@ async def records(
     )
 
 
-    # ==================================================
     # 최근 7개 기록
-    # ==================================================
-
     recent = db.execute(
         """
         SELECT
@@ -926,8 +995,8 @@ async def records(
 
 
     embed.add_field(
-        name="🛡️ 유혹 극복",
-        value=f"**{total_temptations}회**",
+        name="🛡️ 집중 방해 극복",
+        value=f"**{total_distractions}회**",
         inline=True
     )
 
